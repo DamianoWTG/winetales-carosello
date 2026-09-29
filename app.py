@@ -20,7 +20,7 @@ import datetime
 import urllib.request
 from io import BytesIO
 
-from flask import Flask, jsonify, send_from_directory, Response
+from flask import Flask, jsonify, send_from_directory, Response, request
 from PIL import Image, ImageDraw, ImageFont
 
 from assets_b64 import FONT_ROMAN, FONT_ITALIC, LOGO_PNG, GLASS_PNG
@@ -71,29 +71,27 @@ def _open(url):
         raise
 
 
-def fetch_posts():
+def filter_posts(posts):
+    """Filtra i post (arrivati dal browser del collega) sulla settimana lun->sab,
+    esclude le rubriche indesiderate, ordina dal piu' vecchio."""
     oggi = datetime.date.today()
     if DA_LUNEDI:
-        inizio = oggi - datetime.timedelta(days=oggi.weekday())
-        fine = inizio + datetime.timedelta(days=5)
+        inizio = oggi - datetime.timedelta(days=oggi.weekday())   # lunedi'
+        fine = inizio + datetime.timedelta(days=5)                # sabato
     else:
         inizio = oggi - datetime.timedelta(days=DAYS_BACK)
         fine = oggi
-    after = inizio.strftime("%Y-%m-%dT00:00:00")
-    before = fine.strftime("%Y-%m-%dT23:59:59")
-    url = (f"{SITE}/wp-json/wp/v2/posts"
-           f"?after={after}&before={before}&per_page={min(MAX_POSTS,100)}&orderby=date&order=desc&_embed=1")
-    with _open(url) as r:
-        status = getattr(r, "status", 200)
-        raw = r.read().decode("utf-8", "replace")
-    try:
-        posts = json.loads(raw)
-    except Exception:
-        raise RuntimeError(f"Il sito non ha risposto con i dati (HTTP {status}). "
-                           f"Inizio risposta: {raw[:120]!r}")
-    if OLDEST_FIRST:
-        posts = list(reversed(posts))
-    return posts[:MAX_POSTS]
+    a, b = inizio.isoformat(), fine.isoformat()
+
+    def in_finestra(p):
+        d = (p.get("date") or "")[:10]
+        return bool(d) and a <= d <= b
+
+    sel = [p for p in posts if in_finestra(p)]
+    esc = {e.strip().lower() for e in ESCLUDI_RUBRICHE}
+    sel = [p for p in sel if category_of(p).strip().lower() not in esc]
+    sel.sort(key=lambda p: p.get("date", ""))     # dal piu' vecchio
+    return sel[:MAX_POSTS]
 
 
 def fetch_image(url):
@@ -320,21 +318,23 @@ def slug(t, n):
     return f"{n:02d}_{s or 'articolo'}"
 
 
-def genera_cards():
-    posts = fetch_posts()
-    esc = {e.strip().lower() for e in ESCLUDI_RUBRICHE}
-    posts = [p for p in posts if category_of(p).strip().lower() not in esc]
+def genera_cards(posts_json):
+    posts = filter_posts(posts_json)
     if not posts:
         return None, "Nessun articolo pubblicato questa settimana (o erano tutte Blend News)."
 
     rows = []
+    foto_ok = 0
     for p in posts:
+        im = fetch_image(best_image_url(p))
+        if im is not None:
+            foto_ok += 1
         rows.append({
             "titolo": clean_text(p["title"]["rendered"]),
             "hook": clean_hook(p["excerpt"]["rendered"]),
             "categoria": category_of(p),
             "data": p.get("date", "")[:10],
-            "img": fetch_image(best_image_url(p)),
+            "img": im,
         })
 
     cards = [("00_copertina.png", card_copertina(rows))]
@@ -357,7 +357,7 @@ def genera_cards():
             z.write(os.path.join(d, name), name)
 
     return {"id": uid, "names": names, "count": len(names), "articoli": len(rows),
-            "range": daterange_label(rows)}, None
+            "foto_ok": foto_ok, "range": daterange_label(rows)}, None
 
 
 # ============================ WEB ============================
@@ -392,13 +392,21 @@ PAGE = """<!doctype html><html lang="it"><head>
  <div id="msg"></div>
  <div id="out"></div>
 <script>
+var API="https://winetalesmagazine.com/wp-json/wp/v2/posts?per_page=30&orderby=date&order=desc&_embed=1";
 async function genera(){
  var b=document.getElementById('go'), m=document.getElementById('msg'), o=document.getElementById('out');
- b.disabled=true; o.innerHTML=''; m.innerHTML='<span class="spin"></span> &nbsp;Genero le card… (può volerci ~1 minuto)';
+ b.disabled=true; o.innerHTML=''; m.innerHTML='<span class="spin"></span> &nbsp;Leggo gli articoli…';
  try{
-  var r=await fetch('genera',{method:'POST'}); var j=await r.json();
+  // 1) i dati li scarica il TUO browser dal sito (non il server)
+  var pr=await fetch(API,{headers:{'Accept':'application/json'}});
+  if(!pr.ok){ m.textContent='Il sito non risponde ('+pr.status+'). Riprova.'; b.disabled=false; return; }
+  var posts=await pr.json();
+  // 2) il server disegna le card
+  m.innerHTML='<span class="spin"></span> &nbsp;Creo le card… (~1 minuto)';
+  var r=await fetch('genera',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({posts:posts})});
+  var j=await r.json();
   if(!j.ok){ m.textContent = j.error||'Errore'; b.disabled=false; return; }
-  m.textContent = j.count+' card pronte ('+j.articoli+' articoli) — '+j.range;
+  m.textContent = j.count+' card pronte ('+j.articoli+' articoli, '+j.foto_ok+' foto) — '+j.range;
   var h='<a class="zip" href="zip/'+j.id+'">⬇︎ Scarica tutte (ZIP)</a>';
   h+='<p class="hint">Per salvarle: tieni premuto su ogni immagine → “Aggiungi a Foto”.</p>';
   h+='<div class="grid">';
@@ -420,7 +428,11 @@ def index():
 @app.route("/genera", methods=["POST"])
 def genera_route():
     try:
-        data, err = genera_cards()
+        body = request.get_json(force=True, silent=True) or {}
+        posts = body.get("posts")
+        if not isinstance(posts, list):
+            return jsonify({"ok": False, "error": "Dati articoli mancanti dal browser."})
+        data, err = genera_cards(posts)
         if err:
             return jsonify({"ok": False, "error": err})
         return jsonify({"ok": True, **data})
