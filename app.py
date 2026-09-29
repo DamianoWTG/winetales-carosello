@@ -52,8 +52,17 @@ os.makedirs(OUTDIR, exist_ok=True)
 
 
 # ============================ RETE ============================
+_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+
+
 def _open(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "WineTales-Carosello/1.0"})
+    req = urllib.request.Request(url, headers={
+        "User-Agent": _UA,
+        "Accept": "application/json, text/html, */*",
+        "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
+        "Referer": SITE + "/",
+    })
     try:
         return urllib.request.urlopen(req, timeout=45)
     except urllib.error.URLError as e:
@@ -75,7 +84,13 @@ def fetch_posts():
     url = (f"{SITE}/wp-json/wp/v2/posts"
            f"?after={after}&before={before}&per_page={min(MAX_POSTS,100)}&orderby=date&order=desc&_embed=1")
     with _open(url) as r:
-        posts = json.loads(r.read().decode("utf-8"))
+        status = getattr(r, "status", 200)
+        raw = r.read().decode("utf-8", "replace")
+    try:
+        posts = json.loads(raw)
+    except Exception:
+        raise RuntimeError(f"Il sito non ha risposto con i dati (HTTP {status}). "
+                           f"Inizio risposta: {raw[:120]!r}")
     if OLDEST_FIRST:
         posts = list(reversed(posts))
     return posts[:MAX_POSTS]
