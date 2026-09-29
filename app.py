@@ -18,6 +18,7 @@ import zipfile
 import tempfile
 import datetime
 import urllib.request
+import urllib.parse
 from io import BytesIO
 
 from flask import Flask, jsonify, send_from_directory, Response, request
@@ -94,12 +95,22 @@ def filter_posts(posts):
     return sel[:MAX_POSTS]
 
 
+def _weserv(url):
+    # instrada l'immagine attraverso un proxy gratuito (IP non bloccato dal sito)
+    noscheme = re.sub(r"^https?://", "", url)
+    return "https://images.weserv.nl/?url=" + urllib.parse.quote(noscheme, safe="/")
+
+
 def fetch_image(url):
-    try:
-        with _open(url) as r:
-            return Image.open(BytesIO(r.read())).convert("RGB")
-    except Exception:
+    if not url:
         return None
+    for u in (_weserv(url), url):        # prima il proxy, poi (fallback) diretto
+        try:
+            with _open(u) as r:
+                return Image.open(BytesIO(r.read())).convert("RGB")
+        except Exception:
+            continue
+    return None
 
 
 # ============================ TESTO ============================
