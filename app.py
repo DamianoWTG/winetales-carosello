@@ -26,6 +26,24 @@ from PIL import Image, ImageDraw, ImageFont
 
 from assets_b64 import FONT_ROMAN, FONT_ITALIC, LOGO_PNG, GLASS_PNG
 
+# --- Rilevamento volti (OpenCV YuNet). Se non disponibile, si usa comunque il
+#     ritaglio intelligente 'attention' del proxy: il sistema non si rompe mai. ---
+try:
+    import cv2
+    import numpy as np
+    _MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yunet.onnx")
+    if os.path.isfile(_MODEL):
+        FACE_DET = cv2.FaceDetectorYN.create(_MODEL, "", (320, 320), 0.6, 0.3, 5000)
+    else:
+        FACE_DET = None
+except Exception:
+    cv2 = None
+    FACE_DET = None
+
+HAS_FACE = FACE_DET is not None
+FACE_MIN_SCORE = 0.85   # sotto questa confidenza NON e' un volto affidabile
+FACE_Y = 0.42           # posizione verticale del volto nel formato (dall'alto)
+
 # ============================ CONFIG ============================
 SITE          = "https://winetalesmagazine.com"
 DA_LUNEDI     = True                 # lun->sab della settimana (pubblicazione domenica)
@@ -95,27 +113,85 @@ def filter_posts(posts):
     return sel[:MAX_POSTS]
 
 
-def _weserv(url, w=W, h=H):
-    # Proxy gratuito (IP non bloccato dal sito) + RITAGLIO INTELLIGENTE al formato
-    # verticale: 'attention' sceglie il crop sul soggetto piu' importante (rileva
-    # pelle/volti, saturazione e bordi), cosi' non taglia teste, volti o bottiglie
-    # e centra meglio case/cantine.
+def _weserv(url, w=W, h=H, crop=True):
+    # Proxy gratuito (IP non bloccato dal sito). Con crop=True ritaglia gia' al
+    # formato verticale col crop intelligente 'attention' (ripiego per foto senza
+    # volti: botti, etichette, paesaggi). Con crop=False scarica l'originale intero
+    # (serve per rilevare i volti e scegliere noi il ritaglio).
     noscheme = re.sub(r"^https?://", "", url)
     q = urllib.parse.quote(noscheme, safe="/")
-    return (f"https://images.weserv.nl/?url={q}"
-            f"&w={w}&h={h}&fit=cover&a=attention&output=jpg&q=86")
+    base = f"https://images.weserv.nl/?url={q}&output=jpg&q=90"
+    if crop:
+        return base + f"&w={w}&h={h}&fit=cover&a=attention"
+    return base + "&w=1800&h=1800&fit=inside&we"   # originale (max 1800px, no ingrandimenti)
+
+
+def _download_pil(u):
+    try:
+        with _open(u) as r:
+            return Image.open(BytesIO(r.read())).convert("RGB")
+    except Exception:
+        return None
+
+
+def _detect_faces(pil):
+    """Ritorna [(x, y, w, h, score), ...] sulle coordinate dell'immagine originale."""
+    if not HAS_FACE:
+        return []
+    try:
+        w, h = pil.size
+        s = min(1.0, 1024.0 / max(w, h))          # rilevo su max 1024px (veloce)
+        dw, dh = max(1, round(w * s)), max(1, round(h * s))
+        small = pil.resize((dw, dh), Image.BILINEAR) if s < 1.0 else pil
+        bgr = cv2.cvtColor(np.array(small), cv2.COLOR_RGB2BGR)
+        FACE_DET.setInputSize((dw, dh))
+        _, faces = FACE_DET.detect(bgr)
+        out = []
+        if faces is not None:
+            for f in faces:
+                out.append((f[0] / s, f[1] / s, f[2] / s, f[3] / s, float(f[-1])))
+        return out
+    except Exception:
+        return []
+
+
+def _crop_on_point(pil, cx, cy):
+    """Ritaglio 'cover' al formato verticale centrato (in orizzontale) sul punto dato."""
+    w, h = pil.size
+    r = max(W / w, H / h)
+    nw, nh = round(w * r), round(h * r)
+    big = pil.resize((nw, nh), Image.LANCZOS)
+    left = int(round(cx * r - W / 2));  left = max(0, min(left, nw - W))
+    top  = int(round(cy * r - H * FACE_Y));  top = max(0, min(top, nh - H))
+    return big.crop((left, top, left + W, top + H)).convert("RGB")
+
+
+def _face_crop(pil):
+    """Se trova almeno un volto affidabile, centra sul piu' grande e ritaglia.
+    Con due o piu' volti sceglie UNO solo (il principale) e lascia fuori l'altro.
+    Ritorna None se non ci sono volti sicuri (si usera' il ripiego 'attention')."""
+    good = [f for f in _detect_faces(pil) if f[4] >= FACE_MIN_SCORE]
+    if not good:
+        return None
+    x, y, fw, fh, _ = max(good, key=lambda f: f[2] * f[3])   # il volto piu' grande/vicino
+    return _crop_on_point(pil, x + fw / 2.0, y + fh / 2.0)
 
 
 def fetch_image(url):
     if not url:
         return None
-    for u in (_weserv(url), url):        # prima il proxy, poi (fallback) diretto
-        try:
-            with _open(u) as r:
-                return Image.open(BytesIO(r.read())).convert("RGB")
-        except Exception:
-            continue
-    return None
+    # 1) scarico l'originale intero e provo a centrare su un volto
+    orig = _download_pil(_weserv(url, crop=False)) or _download_pil(url)
+    if orig is not None:
+        cut = _face_crop(orig)
+        if cut is not None:
+            return cut
+    # 2) niente volti: ripiego sul ritaglio intelligente 'attention' del proxy
+    att = _download_pil(_weserv(url, crop=True))
+    if att is not None:
+        return att
+    # 3) ultimo ripiego: l'originale (ci pensa cover_fit a riquadrarlo)
+    return orig
 
 
 # ============================ TESTO ============================
