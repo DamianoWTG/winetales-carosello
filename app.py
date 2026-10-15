@@ -95,10 +95,15 @@ def filter_posts(posts):
     return sel[:MAX_POSTS]
 
 
-def _weserv(url):
-    # instrada l'immagine attraverso un proxy gratuito (IP non bloccato dal sito)
+def _weserv(url, w=W, h=H):
+    # Proxy gratuito (IP non bloccato dal sito) + RITAGLIO INTELLIGENTE al formato
+    # verticale: 'attention' sceglie il crop sul soggetto piu' importante (rileva
+    # pelle/volti, saturazione e bordi), cosi' non taglia teste, volti o bottiglie
+    # e centra meglio case/cantine.
     noscheme = re.sub(r"^https?://", "", url)
-    return "https://images.weserv.nl/?url=" + urllib.parse.quote(noscheme, safe="/")
+    q = urllib.parse.quote(noscheme, safe="/")
+    return (f"https://images.weserv.nl/?url={q}"
+            f"&w={w}&h={h}&fit=cover&a=attention&output=jpg&q=86")
 
 
 def fetch_image(url):
